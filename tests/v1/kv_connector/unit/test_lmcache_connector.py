@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
@@ -195,6 +195,27 @@ class TestGetKVConnectorKVCacheEvents:
 
         events = result.get_all_events()
         assert events[0].parent_block_hash is None
+
+    def test_converts_cache_remove_event_without_store_fields(self, mock_connector):
+        """CacheRemoveEvent must not be treated as a BlockStored event."""
+
+        class MockCacheRemoveEvent:
+            def __init__(self):
+                self.block_hashes = ["removed_hash"]
+                self.medium = "CPU"
+
+        mock_connector._lmcache_engine.get_kv_events.return_value = [
+            MockCacheRemoveEvent()
+        ]
+
+        result = mock_connector.get_kv_connector_kv_cache_events()
+
+        assert result is not None
+        events = result.get_all_events()
+        assert len(events) == 1
+        assert isinstance(events[0], BlockRemoved)
+        assert events[0].block_hashes == ["removed_hash"]
+        assert events[0].medium == "CPU"
 
 
 class TestUpdateConnectorOutput:

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import queue
+import struct
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -269,6 +271,8 @@ class ZmqEventPublisher(EventPublisher):
 
     SHUTDOWN_TIMEOUT: float = 1.0
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
+    _EVENT_RECORD_HEADER = struct.Struct(">Q")
+    _MAX_REPLAY_PAYLOAD_BYTES = 64 * 1024 * 1024
 
     def __init__(
         self,
@@ -284,6 +288,29 @@ class ZmqEventPublisher(EventPublisher):
         super().__init__(data_parallel_rank)
         self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
+
+        # The benchmark harness can record the exact msgpack EventBatch
+        # payloads emitted by a canonical run and replay them into a fresh
+        # publisher.  The payload is deliberately recorded before any
+        # Dynamo conversion so replay uses the same wire contract as a live
+        # vLLM worker.  Both features are opt-in and have no effect on normal
+        # deployments.
+        self._record_path = os.environ.get("VLLM_KV_EVENT_RECORD_PATH")
+        self._replay_path = os.environ.get("VLLM_KV_EVENT_REPLAY_PATH")
+        self._replay_delay_seconds = self._env_float(
+            "VLLM_KV_EVENT_REPLAY_DELAY_SECONDS", 0.0
+        )
+        self._replay_payloads = self._load_replay_payloads(self._replay_path)
+        if self._record_path:
+            os.makedirs(os.path.dirname(self._record_path) or ".", exist_ok=True)
+            logger.info("Recording raw KV event batches to %s", self._record_path)
+        if self._replay_path:
+            logger.info(
+                "Loaded %d raw KV event batches from %s; replay delay %.3fs",
+                len(self._replay_payloads),
+                self._replay_path,
+                self._replay_delay_seconds,
+            )
 
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
@@ -382,6 +409,18 @@ class ZmqEventPublisher(EventPublisher):
 
         assert self._pub is not None  # narrows type for mypy
 
+        replay_index = 0
+        replay_ready_at = (
+            time.monotonic() + self._replay_delay_seconds
+            if self._replay_payloads
+            else None
+        )
+        replay_complete_logged = not self._replay_payloads
+        if self._replay_path and replay_complete_logged:
+            logger.info(
+                "KV event replay completed path=%s batches=0", self._replay_path
+            )
+
         while self._running or self._event_queue.qsize() > 0:
             # --- replay (non-critical) ---------------------------------
             if self._replay is not None and self._replay.poll(0):
@@ -390,9 +429,52 @@ class ZmqEventPublisher(EventPublisher):
                 except Exception as e:
                     logger.exception("Error in replay: %s", e)
 
+            # A restored benchmark starts with a fresh vLLM process, so the
+            # GPU/CPU tiers are empty.  Replaying the canonical CXL-only
+            # event stream rebuilds Dynamo's CXL membership before requests
+            # are sent.  Send at most one batch per loop so normal live
+            # events remain bounded if a caller publishes during replay.
+            if (
+                replay_ready_at is not None
+                and replay_index < len(self._replay_payloads)
+                and time.monotonic() >= replay_ready_at
+            ):
+                try:
+                    payload = self._replay_payloads[replay_index]
+                    seq = next(self._seq_gen)
+                    seq_bytes = seq.to_bytes(8, "big")
+                    self._pub.send_multipart(
+                        (self._topic_bytes, seq_bytes, payload)
+                    )
+                    self._buffer.append((seq, payload))
+                    replay_index += 1
+                    if (
+                        replay_index == len(self._replay_payloads)
+                        and not replay_complete_logged
+                    ):
+                        logger.info(
+                            "KV event replay completed path=%s batches=%d",
+                            self._replay_path,
+                            replay_index,
+                        )
+                        replay_complete_logged = True
+                        replay_ready_at = None
+                except Exception as e:
+                    logger.exception("Error replaying KV event batch: %s", e)
+                    time.sleep(0.1)
+
             # --- main queue (critical) ---------------------------------
             try:
-                event = self._event_queue.get(timeout=0.1)
+                event = self._event_queue.get(
+                    timeout=(
+                        0.0
+                        if replay_ready_at is not None
+                        and replay_index < len(self._replay_payloads)
+                        else 0.05
+                        if replay_ready_at is not None
+                        else 0.1
+                    )
+                )
                 if event is None:
                     break  # Sentinel received, exit thread
             except queue.Empty:
@@ -405,6 +487,9 @@ class ZmqEventPublisher(EventPublisher):
                 seq_bytes = seq.to_bytes(8, "big")
                 self._pub.send_multipart((self._topic_bytes, seq_bytes, payload))
 
+                if self._record_path:
+                    self._record_event_payload(payload)
+
                 self._buffer.append((seq, payload))
                 self._event_queue.task_done()
 
@@ -412,6 +497,50 @@ class ZmqEventPublisher(EventPublisher):
                 # Publishing failed;  back-off a bit to avoid a tight error loop
                 logger.exception("Error in publisher thread: %s", e)
                 time.sleep(0.1)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            logger.warning("Invalid %s=%r; using %.3f", name, value, default)
+            return default
+
+    @classmethod
+    def _load_replay_payloads(cls, path: str | None) -> list[bytes]:
+        if not path:
+            return []
+        try:
+            with open(path, "rb") as handle:
+                payloads: list[bytes] = []
+                while True:
+                    header = handle.read(cls._EVENT_RECORD_HEADER.size)
+                    if not header:
+                        break
+                    if len(header) != cls._EVENT_RECORD_HEADER.size:
+                        raise ValueError("truncated EventBatch length header")
+                    (length,) = cls._EVENT_RECORD_HEADER.unpack(header)
+                    if length > cls._MAX_REPLAY_PAYLOAD_BYTES:
+                        raise ValueError(
+                            f"EventBatch payload is too large: {length} bytes"
+                        )
+                    payload = handle.read(length)
+                    if len(payload) != length:
+                        raise ValueError("truncated EventBatch payload")
+                    payloads.append(payload)
+                return payloads
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"KV event replay file does not exist: {path}") from exc
+
+    def _record_event_payload(self, payload: bytes) -> None:
+        assert self._record_path is not None
+        header = self._EVENT_RECORD_HEADER.pack(len(payload))
+        with open(self._record_path, "ab", buffering=0) as handle:
+            handle.write(header)
+            handle.write(payload)
 
     def _service_replay(self) -> None:
         """If a replay request is waiting, send buffered batches."""
