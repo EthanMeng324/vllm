@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     CompletionOutput,
@@ -31,6 +35,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -364,6 +370,24 @@ class OutputProcessor:
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
+        self._queue_trace_file = None
+        queue_trace_path = os.environ.get("VLLM_REQUEST_QUEUE_TRACE_PATH")
+        if queue_trace_path:
+            try:
+                queue_trace_dir = os.path.dirname(queue_trace_path)
+                if queue_trace_dir:
+                    os.makedirs(queue_trace_dir, exist_ok=True)
+                self._queue_trace_file = open(
+                    queue_trace_path,
+                    "a",
+                    encoding="utf-8",
+                    buffering=1,
+                )
+            except OSError:
+                logger.exception(
+                    "Could not open per-request queue trace at %s",
+                    queue_trace_path,
+                )
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
@@ -708,8 +732,74 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        self._write_queue_trace(req_state, finish_reason, iteration_stats)
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
         )
+
+    def _write_queue_trace(
+        self,
+        req_state: RequestState,
+        finish_reason: FinishReason,
+        iteration_stats: IterationStats,
+    ) -> None:
+        """Persist the exact vLLM worker waiting-queue interval per request.
+
+        ``queued_ts`` is recorded by the EngineCore scheduler when the request
+        enters its waiting queue, and ``scheduled_ts`` is recorded at the
+        request's first scheduling event.  This is intentionally written from
+        the same stats object used by the standard vLLM queue-time metric so
+        benchmark analysis does not need to infer queueing from TTFT.
+        """
+        if self._queue_trace_file is None or req_state.stats is None:
+            return
+
+        metrics = req_state.stats
+        has_queue_timestamps = metrics.queued_ts > 0 and metrics.scheduled_ts > 0
+        queue_time = (
+            metrics.scheduled_ts - metrics.queued_ts
+            if has_queue_timestamps
+            else None
+        )
+        prefill_time = (
+            metrics.first_token_ts - metrics.scheduled_ts
+            if has_queue_timestamps and metrics.first_token_ts > 0
+            else None
+        )
+        row = {
+            "event": "request_finished",
+            "trace_kind": "vllm_engine_core_queue",
+            "external_request_id": req_state.external_req_id,
+            "internal_request_id": req_state.request_id,
+            "worker_label": os.environ.get("VLLM_REQUEST_QUEUE_TRACE_WORKER"),
+            "trace_pid": os.getpid(),
+            "trace_emitted_unix_ns": time.time_ns(),
+            "frontend_arrival_unix_s": metrics.arrival_time,
+            "worker_queue_enter_monotonic_s": metrics.queued_ts or None,
+            "first_scheduled_monotonic_s": metrics.scheduled_ts or None,
+            "first_token_monotonic_s": metrics.first_token_ts or None,
+            "last_token_monotonic_s": metrics.last_token_ts or None,
+            "worker_queue_time_s": queue_time,
+            "prefill_time_s": prefill_time,
+            "e2e_time_s": iteration_stats.iteration_timestamp - metrics.arrival_time,
+            "finish_reason": str(finish_reason),
+            "num_prompt_tokens": req_state.prompt_len,
+            "num_generation_tokens": metrics.num_generation_tokens,
+            "num_cached_tokens": req_state.num_cached_tokens,
+        }
+        try:
+            self._queue_trace_file.write(
+                json.dumps(row, separators=(",", ":")) + "\n"
+            )
+            self._queue_trace_file.flush()
+        except (OSError, ValueError):
+            logger.exception(
+                "Could not write per-request queue trace for %s",
+                req_state.external_req_id,
+            )
+            try:
+                self._queue_trace_file.close()
+            finally:
+                self._queue_trace_file = None
